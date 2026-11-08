@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Reverse Latent Sparse Attention, explained</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#eef1f6;--sf:#fff;--ink:#1b2033;--mut:#5b6380;--ln:#d3d9e6;--ind:#2d3a8c;--teal:#0e8a86;--amb:#d98a0b;--red:#c43456;--gry:#aab1c4;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141829;--sf:#1d2238;--ink:#e6e9f5;--mut:#98a0bf;--ln:#323a5c;--ind:#8f9cff;--teal:#3fcfc9;--amb:#f2b34a;--red:#ff7a98;--gry:#4b5478}}
+:root[data-theme="dark"]{--bg:#141829;--sf:#1d2238;--ink:#e6e9f5;--mut:#98a0bf;--ln:#323a5c;--ind:#8f9cff;--teal:#3fcfc9;--amb:#f2b34a;--red:#ff7a98;--gry:#4b5478}
+html{scroll-padding-top:60px}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 "IBM Plex Sans",system-ui,sans-serif}
+h1,h2,h3{font-family:"Bricolage Grotesque",system-ui,sans-serif;line-height:1.15;margin:0 0 .5em}
+h1{font-size:clamp(2rem,5vw,3.2rem);letter-spacing:-.02em}h2{font-size:1.6rem}h3{font-size:1.1rem}
+main{max-width:980px;margin:0 auto;padding:24px 18px 80px}
+p{max-width:70ch;margin:.4em 0 .9em}.mut{color:var(--mut)}
+nav{position:sticky;top:env(safe-area-inset-top,0px);background:var(--bg);z-index:5;border-bottom:1px solid var(--ln);display:flex;gap:4px;overflow-x:auto;padding:8px 14px}
+nav a{padding:6px 12px;border-radius:99px;color:var(--mut);text-decoration:none;white-space:nowrap;font-weight:500}
+nav a.on{background:var(--ind);color:var(--bg)}
+nav a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--amb);outline-offset:2px}
+section{display:none}section.on{display:block}
+.card{background:var(--sf);border:1px solid var(--ln);border-radius:10px;padding:16px 18px;margin:14px 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+.big{font:700 1.9rem "Bricolage Grotesque",sans-serif;color:var(--ind)}
+.sc{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:.92rem}
+td,th{border-bottom:1px solid var(--ln);padding:6px 8px;text-align:left;vertical-align:top}th{color:var(--mut);font-weight:500}
+code{font:.88em ui-monospace,Menlo,monospace;background:var(--bg);padding:1px 5px;border-radius:4px}
+.ctl{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin:8px 0}.ctl label{display:flex;gap:6px;align-items:center;font-size:.9rem}
+button{font:inherit;background:var(--sf);color:var(--ink);border:1px solid var(--ln);border-radius:8px;padding:6px 12px;cursor:pointer}
+button.on{background:var(--ind);color:var(--bg);border-color:var(--ind)}
+svg{width:100%;height:auto;display:block}svg text{fill:var(--ink);font:12px "IBM Plex Sans",sans-serif}
+.layers{display:flex;gap:6px;flex-wrap:wrap}.ly{flex:1 1 90px;min-width:80px;padding:10px 6px;text-align:center;border-radius:8px;border:2px solid var(--ln);background:var(--sf);color:var(--ink)}
+.ly.g{border-color:var(--teal);background:color-mix(in srgb,var(--teal) 16%,var(--sf))}.ly.sel{outline:3px solid var(--amb)}
+.bars{display:flex;gap:4px;align-items:flex-end;height:150px;border-bottom:1px solid var(--ink);margin-top:8px}
+.bars div{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:stretch;height:100%;position:relative}
+.bars i{display:block}.keys{display:flex;height:34px;border-radius:6px;overflow:hidden;margin:8px 0;font-size:.75rem}
+.keys span{display:flex;align-items:center;justify-content:center;color:#fff;min-width:2px;overflow:hidden}
+details{border-top:1px solid var(--ln);padding:8px 0}summary{cursor:pointer;font-weight:500}
+.tag{display:inline-block;padding:0 8px;border-radius:99px;font-size:.78rem;border:1px solid var(--ln);color:var(--mut)}
+.ok{color:var(--teal)}.bad{color:var(--red)}
+@media(prefers-reduced-motion:no-preference){.bars i{transition:height .25s}}
+</style></head><body>
+<nav id="nav"></nav>
+<main>
+<section id="overview">
+<h1>Reverse Latent Sparse Attention</h1>
+<p>A small decoder-only language model (11,431,552 parameters) where the long-range layers do not look at every earlier token. Each key is <b>written</b> into a few learned anchor buckets as it appears, and each query tile <b>reads</b> only the buckets that look relevant. Most layers use plain sliding-window attention.</p>
+<div class="grid">
+<div class="card"><div class="big">8</div>layers: 6 sliding-window (RoPE), 2 global R-LSA (no positional encoding)</div>
+<div class="card"><div class="big">~600</div>keys per query tile in R-LSA at 1K context: 4 sink + ≤256 remote + 64 summary + ≤272 local</div>
+<div class="card"><div class="big">1 KV head</div>multi-query attention: 5 query heads share one 64-dim key/value head</div>
+</div>
+<h2>The idea in one picture</h2>
+<div class="card"><svg viewBox="0 0 900 250" role="img" aria-label="Write then read flow">
+<g fill="none" stroke-width="2"><rect x="10" y="30" width="190" height="80" rx="8" stroke="var(--ind)"/><rect x="250" y="30" width="190" height="80" rx="8" stroke="var(--teal)"/><rect x="490" y="30" width="190" height="80" rx="8" stroke="var(--amb)"/><rect x="720" y="30" width="170" height="80" rx="8" stroke="var(--red)"/></g>
+<g text-anchor="middle"><text x="105" y="62" font-weight="700">1. Write (reverse)</text><text x="105" y="82">each key → top-2 anchors</text><text x="105" y="98">per 256-token block</text>
+<text x="345" y="62" font-weight="700">2. Close blocks</text><text x="345" y="82">buckets keep ≤16 keys,</text><text x="345" y="98">centroids + summaries</text>
+<text x="585" y="62" font-weight="700">3. Read (hierarchical)</text><text x="585" y="82">query → 6 anchors → 32</text><text x="585" y="98">best buckets → ≤256 keys</text>
+<text x="805" y="62" font-weight="700">4. Attend</text><text x="805" y="82">sinks + remote + summary</text><text x="805" y="98">+ local window, one SDPA</text></g>
+<g stroke="var(--mut)" stroke-width="2"><path d="M200 70h50M440 70h50M680 70h40"/></g>
+<text x="10" y="160">Why “reverse”: ordinary routing makes each query search all keys. Here keys do the routing work once,</text>
+<text x="10" y="180">at write time, so a query only has to compare against 64 anchors and then a few bucket centroids.</text>
+<text x="10" y="215" fill="var(--mut)">Causality: a block is usable only after it is closed and older than the 256-token local window.</text></svg></div>
+<h2>Forward pass, step by step</h2>
+<div class="card" id="flow"></div>
+</section>
+
+<section id="config">
+<h2>Model configuration</h2>
+<div class="card sc"><table id="cfgt"></table></div>
+<h2>Layer stack (click a layer)</h2>
+<div class="card"><div class="layers" id="layers"></div><p id="lyinfo" style="margin-top:12px"></p></div>
+<h2>Where the 11,431,552 parameters live</h2>
+<div class="card sc"><table>
+<tr><th>Part</th><th>Math</th><th>Params</th></tr>
+<tr><td>Tied token embedding / LM head</td><td>8000 × 320</td><td>2,560,000</td></tr>
+<tr><td>Attention per block</td><td>Q 320² + K 320×64 + V 320×64 + out 320²</td><td>245,760</td></tr>
+<tr><td>SwiGLU per block</td><td>3 × 320 × 896</td><td>860,160</td></tr>
+<tr><td>Two LayerNorms per block</td><td>2 × (320+320)</td><td>1,280</td></tr>
+<tr><td>8 blocks</td><td>8 × 1,107,200</td><td>8,857,600</td></tr>
+<tr><td>R-LSA extras, per global layer (×2)</td><td>q_index 64×32 + k_index 64×32 + sink K/V 2×(5×4×64)</td><td>6,656</td></tr>
+<tr><td>Final LayerNorm</td><td>320 + 320</td><td>640</td></tr>
+<tr><td><b>Total</b></td><td></td><td><b>11,431,552</b></td></tr></table>
+<p class="mut">Anchors, anchor-update counter and load-balance bias are buffers, not trained parameters. Phase 3 asserts this exact count, and <code>check_checkpoint.py</code> rejects any checkpoint that differs.</p></div>
+</section>
+
+<section id="write">
+<h2>Step 1: reverse write simulation</h2>
+<p>Each key picks its <code>write_top_r</code> most similar anchors. Every (block, anchor) bucket holds at most <code>bucket_capacity</code> keys; extra writes are dropped, lowest similarity first. This toy uses 2D angles and one block of 64 keys (real: 256 keys, 64 anchors, r=2, capacity 16).</p>
+<div class="card"><div class="ctl">
+<label>anchors <input type="range" id="wA" min="4" max="16" value="8"><b id="wAv"></b></label>
+<label>write r <input type="range" id="wr" min="1" max="3" value="2"><b id="wrv"></b></label>
+<label>capacity <input type="range" id="wc" min="2" max="24" value="12"><b id="wcv"></b></label>
+<button id="wre">Resample keys</button></div>
+<svg viewBox="0 0 420 330" id="wsvg" role="img" aria-label="Keys connected to anchors"></svg>
+<div class="bars" id="wbars"></div><p id="wstat" class="mut"></p></div>
+<div class="card"><h3>What the real code adds</h3>
+<p><b>Load balancing.</b> Eight vectorised rounds nudge a per-anchor bias so each anchor’s assignment count approaches <code>block_size × r / n_anchors</code> = 8 per block-anchor on average (bias clamped to ±0.5, plus a learned running <code>load_balance_bias</code>). <b>Centroids.</b> Each bucket stores the normalised mean of its retained key features. <b>Summaries.</b> Each retained key adds 1/r of its K and V to a per-anchor running sum, giving one cheap “average of everything in this anchor” token later.</p></div>
+</section>
+
+<section id="read">
+<h2>Step 2: hierarchical read simulation</h2>
+<p>Move the query tile through the sequence. Queries are grouped in tiles of 16; the tile-start token’s index feature does the routing. Cutoff = <code>start − 256 − 1</code>; only blocks whose last token is ≤ cutoff are searchable.</p>
+<div class="card"><div class="ctl"><span>Sequence</span><span id="tl"></span>
+<label>tile start <input type="range" id="qs" min="0" max="1008" step="16" value="800" style="width:220px"><b id="qsv"></b></label></div>
+<svg viewBox="0 0 900 150" id="rsvg" role="img" aria-label="Timeline of blocks, local window and query tile"></svg>
+<div class="keys" id="rkeys"></div>
+<div id="rtxt"></div></div>
+<div class="card"><h3>The five read steps</h3><ol>
+<li>Score the tile’s feature against 64 anchors, keep the top <b>6</b> (<code>query_top_a</code>).</li>
+<li>For each eligible block, take the centroids of those 6 anchors’ buckets. Bucket score = centroid · query + 0.1 × anchor score. Empty buckets are masked.</li>
+<li>Keep the <b>32</b> best (block, anchor) buckets across all eligible blocks (<code>bucket_top_p</code>).</li>
+<li>Expand to member keys: 32 × 16 = 512 candidates, in best-first order.</li>
+<li>Stable-sort deduplicate (a key written to two anchors may appear twice), then keep the first <b>256</b>. The bucket score becomes an additive attention bias for those keys.</li></ol>
+<p class="mut">The <code>flat_lsa</code> ablation skips steps 1–2: it scores every anchor in every block, but still keeps only 32 buckets.</p></div>
+</section>
+
+<section id="assemble">
+<h2>Step 3: assembling one attention call</h2>
+<div class="card"><div class="keys" style="height:44px;font-size:.85rem">
+<span style="flex:4;background:var(--gry)">sink 4</span><span style="flex:256;background:var(--teal)">remote ≤256 (bias = bucket score)</span><span style="flex:64;background:var(--ind)">summary 64</span><span style="flex:272;background:var(--amb)">local 256 + 16 tile</span></div>
+<table><tr><th>Segment</th><th>Source</th><th>Additive bias</th><th>Mask</th></tr>
+<tr><td>Sink (4)</td><td>learned <code>sink_k / sink_v</code> per head</td><td>0</td><td>always visible</td></tr>
+<tr><td>Remote (256)</td><td>real K/V of retrieved tokens (shared across heads)</td><td>bucket score</td><td>valid slots only</td></tr>
+<tr><td>Summary (64)</td><td>per-anchor mean K/V over all closed blocks, <b>minus</b> keys already retrieved</td><td>log(remaining mass)</td><td>mass &gt; 0</td></tr>
+<tr><td>Local (272)</td><td>keys from start−256 to start+15</td><td>0</td><td>key position ≤ query position</td></tr></table>
+<p>Subtracting the retrieved keys from the summary prevents counting the same token twice. All 16 queries in a tile share the retrieved set, but the local mask is per query, so causality stays exact. Tiles are processed 32 at a time, and the result is one <code>scaled_dot_product_attention</code> call per chunk with an additive float mask.</p>
+<p><b>Design note:</b> tokens between the last closed block and the start of the local window are not visible to either path until their block closes (up to 255 tokens). Try tile start 800 in the read tab to see the gap.</p></div>
+<h2>Training-time state</h2>
+<div class="card"><p><b>EMA anchors.</b> After every forward pass, all token query features are assigned to their nearest anchor; anchors move 5% toward the cluster mean (<code>ema_decay</code> 0.95) and are re-normalised. Anchors with no queries are reseeded from the worst-represented queries. Routing in the current pass uses the old anchors.</p>
+<p><b>Index gradients.</b> Routing choices are hard (top-k), but the bucket score is added to the attention logits, so <code>q_index</code> and <code>k_index</code> still get gradients. Phase 2 and 3 check this.</p></div>
+</section>
+
+<section id="train">
+<h2>Training and evaluation flow</h2>
+<div class="card"><div class="grid">
+<div><h3>Stage 1: dense warm-up</h3><p>Global layers use exact causal dense attention. Sequence 512, 200 steps, peak lr 3e-4. The EMA anchors warm up from real query statistics during this stage.</p></div>
+<div><h3>Stage 2: switch to R-LSA</h3><p>Same weights, global layers now use R-LSA. Sequence 1024, 200 steps, peak lr 1e-4.</p></div></div>
+<p>Common settings: AdamW (betas 0.9/0.95, weight decay 0.1), cosine decay to 2e-5, grad clip 1.0, batch 1 × grad-accum 2, bf16 autocast, evaluation every 50 steps on 8 validation batches, final test on 8 batches. Data: a small WikiText-103 subset, 8000-token vocabulary.</p>
+<p>Logged router health: bucket overflow rate, assignment load mean/std/max, bucket fill, active query anchors, and active EMA anchors out of 64.</p></div>
+<h2>Phase 5 ablation modes</h2>
+<div class="card sc"><table><tr><th>Mode</th><th>What changes</th></tr>
+<tr><td><code>dense</code></td><td>global layers use full causal attention</td></tr><tr><td><code>swa</code></td><td>every layer is sliding-window only</td></tr>
+<tr><td><code>rlsa</code></td><td>full method</td></tr><tr><td><code>rlsa_no_summaries</code></td><td>summary tokens removed</td></tr>
+<tr><td><code>flat_lsa</code></td><td>flat scan over all (block, anchor) centroids</td></tr></table>
+<p class="mut">All modes load the same checkpoint and see identical windows. This is a checkpoint ablation, not retraining each mode, so it favours the way the weights were trained.</p></div>
+</section>
+
+<section id="phases">
+<h2>Phase by phase</h2>
+<p>Each phase writes a pass file; the next phase refuses to run without it. Re-running an earlier phase deletes later pass files unless <code>--preserve-downstream</code> is given.</p>
+<div class="card" id="ph"></div>
+</section>
+</main>
+<script>
+const $=s=>document.querySelector(s),sv=(v)=>v;
+const TABS=[["overview","Overview"],["config","Config & layers"],["write","Write sim"],["read","Read sim"],["assemble","Attention call"],["train","Training"],["phases","Phases"]];
+const nav=$("#nav");TABS.forEach(([id,n])=>{const a=document.createElement("a");a.href="#"+id;a.textContent=n;a.dataset.id=id;nav.appendChild(a)});
+function route(){let id=(location.hash||"#overview").slice(1);if(!TABS.some(t=>t[0]==id))id="overview";
+document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id==id));
+nav.querySelectorAll("a").forEach(a=>a.classList.toggle("on",a.dataset.id==id));window.scrollTo(0,0)}
+addEventListener("hashchange",route);route();
+
+const FLOW=[["Token embedding","8000 × 320 table, shared with the LM head. Dropout 0.05."],
+["LayerNorm → project","q: 320→320 (5 heads × 64). k and v: 320→64 each, one shared head (multi-query attention)."],
+["Position handling","Sliding-window layers apply rotary embeddings to q and k. Global R-LSA layers use none (NoPE), since retrieved keys come from arbitrary distances."],
+["Attention path","Layers 1–3, 5–7: causal window of 256 tokens. Layers 4 and 8: dense in stage 1, R-LSA in stage 2."],
+["Output projection + residual","Heads concatenated, projected 320→320, added to the stream."],
+["LayerNorm → SwiGLU + residual","silu(gate(x)) × up(x), 320→896→320."],
+["Final LayerNorm → tied LM head","Logits over 8000 tokens; cross-entropy against next token."]];
+$("#flow").innerHTML=FLOW.map(([t,d],i)=>`<details ${i==3?"open":""}><summary>${i+1}. ${t}</summary><p>${d}</p></details>`).join("")+
+`<details><summary>Inside an R-LSA layer (11 sub-steps)</summary><ol><li>Average q over heads, project with q_index to 32 dims, normalise; project k with k_index.</li><li>Build the reverse index per 256-token block (write step).</li><li>Prefix-sum summaries so any cutoff costs one lookup.</li><li>Pad and split queries into 16-token tiles.</li><li>Pick each tile’s routing feature (its first token).</li><li>Retrieve ≤256 remote keys (read step).</li><li>Build summary tokens minus retrieved keys.</li><li>Gather local keys (256 behind plus tile) and 4 sinks.</li><li>Concatenate, add bias, mask, run SDPA.</li><li>In training: EMA anchor update and load-balance bias update.</li><li>Emit diagnostics (overflow, loads, active anchors).</li></ol></details>`;
+
+const CFG=[["vocab_size","8000","Token vocabulary (set from dataset metadata)"],["block_size","256","Tokens per reverse-index block"],["query_tile_size","16","Queries sharing one retrieval"],["query_tile_batch_size","32","Tiles processed per SDPA chunk"],["n_anchors","64","Learned prototypes (spherical k-means by EMA)"],["write_top_r","2","Anchors each key is written to"],["bucket_capacity","16","Max keys per (block, anchor)"],["query_top_a","6","Anchors a query tile consults"],["bucket_top_p","32","Buckets kept after scoring"],["remote_key_budget","256","Max retrieved keys per tile"],["local_window","256","Sliding-window length; also the retrieval delay"],["n_sink_tokens","4","Learned always-visible K/V slots"],["index_dim","32","Routing feature size"],["n_layer / n_head","8 / 5","Layers; query heads"],["n_embd / head_dim","320 / 64","Width; per-head size"],["ffn_hidden","896","SwiGLU hidden size"],["dropout","0.05","Residual, FFN and attention dropout"],["ema_decay","0.95","Anchor momentum"],["rope_theta","10000","RoPE base (SWA layers only)"],["global_every","4","Every 4th layer is global"]];
+$("#cfgt").innerHTML="<tr><th>Field</th><th>Value</th><th>Role</th></tr>"+CFG.map(r=>`<tr><td><code>${r[0]}</code></td><td>${r[1]}</td><td>${r[2]}</td></tr>`).join("");
+const L=$("#layers"),info=$("#lyinfo");
+function pickLayer(i){const g=(i+1)%4==0;L.querySelectorAll(".ly").forEach((b,j)=>b.classList.toggle("sel",j==i));
+info.innerHTML=g?`<b>Layer ${i+1}: global.</b> Dense causal attention in stage 1, R-LSA in stage 2. No RoPE. Owns q_index, k_index, 64 anchors, load-balance bias and 4 sink K/V slots. Sees about 600 keys per tile instead of up to 1024.`:`<b>Layer ${i+1}: sliding window.</b> Causal attention over the previous 256 tokens with RoPE on q and k. Plain, cheap, and gives local syntax.`}
+for(let i=0;i<8;i++){const b=document.createElement("button");b.className="ly"+((i+1)%4==0?" g":"");b.innerHTML=`L${i+1}<br><small>${(i+1)%4==0?"R-LSA":"SWA"}</small>`;b.onclick=()=>pickLayer(i);L.appendChild(b)}pickLayer(3);
+
+/* write sim */
+function rng(s){return()=>{s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let wseed=7;
+function wsim(){const A=+$("#wA").value,r=+$("#wr").value,cap=+$("#wc").value,N=64;
+$("#wAv").textContent=A;$("#wrv").textContent=r;$("#wcv").textContent=cap;
+const R=rng(wseed),cent=[0,1,2,3,4].map(()=>R()*6.283),aa=[...Array(A)].map((_,i)=>6.283*i/A+0.1*(R()-.5));
+const toks=[...Array(N)].map(()=>{const c=cent[Math.floor(R()*5)];const th=c+(R()+R()+R()-1.5)*.9;return{th,rad:92+R()*34}});
+const bk=aa.map(()=>[]);
+toks.forEach((t,ti)=>{t.top=aa.map((a,i)=>[Math.cos(t.th-a),i]).sort((x,y)=>y[0]-x[0]).slice(0,r);t.top.forEach(([s,i])=>bk[i].push({ti,s}))});
+let over=0,kept=0;const drop=new Set();
+bk.forEach((b,i)=>{b.sort((x,y)=>y.s-x.s);b.forEach((e,j)=>{if(j>=cap){over++;drop.add(e.ti+"_"+i)}else kept++})});
+const cx=210,cy=165,col=i=>`hsl(${i*360/A},62%,50%)`;
+let s=`<circle cx="${cx}" cy="${cy}" r="140" fill="none" stroke="var(--ln)"/>`;
+toks.forEach((t,ti)=>{const x=cx+t.rad*Math.cos(t.th),y=cy+t.rad*Math.sin(t.th);t.x=x;t.y=y;
+t.top.forEach(([,i])=>{const ax=cx+140*Math.cos(aa[i]),ay=cy+140*Math.sin(aa[i]),d=drop.has(ti+"_"+i);
+s+=`<line x1="${x}" y1="${y}" x2="${ax}" y2="${ay}" stroke="${d?"var(--red)":col(i)}" stroke-opacity="${d?.8:.3}" ${d?'stroke-dasharray="3 3"':""}/>`});
+s+=`<circle cx="${x}" cy="${y}" r="3" fill="${col(t.top[0][1])}"/>`});
+aa.forEach((a,i)=>{const x=cx+140*Math.cos(a),y=cy+140*Math.sin(a);s+=`<circle cx="${x}" cy="${y}" r="9" fill="${col(i)}" stroke="var(--bg)" stroke-width="2"/><text x="${x}" y="${y+4}" text-anchor="middle" fill="#fff" style="fill:#fff;font-size:10px">${i}</text>`});
+$("#wsvg").innerHTML=s;
+const mx=Math.max(cap,...bk.map(b=>b.length));
+$("#wbars").innerHTML=bk.map((b,i)=>{const k=Math.min(b.length,cap),o=Math.max(0,b.length-cap),u=100/mx;
+return`<div title="anchor ${i}: ${b.length} assigned"><i style="height:${o*u}%;background:var(--red);opacity:.7"></i><i style="height:${k*u}%;background:${col(i)}"></i></div>`}).join("");
+const tot=N*r;$("#wstat").innerHTML=`Assignments: ${tot} · kept: <b class="ok">${kept}</b> · dropped by capacity: <b class="${over?"bad":"ok"}">${over}</b> (${(100*over/tot).toFixed(1)}%). Bars: assigned keys per anchor (red = over capacity). Even load would be ${(tot/A).toFixed(1)} per anchor. Dashed red lines mark dropped writes.`}
+["wA","wr","wc"].forEach(i=>$("#"+i).oninput=wsim);$("#wre").onclick=()=>{wseed=Math.floor(Math.random()*1e6);wsim()};wsim();
+
+/* read sim */
+let T=1024;const qs=$("#qs");
+function rsim(){const st=+qs.value,tile=16,B=256,W=256;qs.max=T-tile;$("#qsv").textContent=st;
+const cut=st-W-1,nb=Math.max(0,Math.min(Math.floor(T/B),Math.floor((cut+1)/B)));
+const x=p=>10+880*p/T;let s="";
+for(let b=0;b<T/B;b++){const el=b<nb;s+=`<rect x="${x(b*B)}" y="40" width="${x(B)-10}" height="34" fill="${el?"var(--teal)":"var(--gry)"}" opacity="${el?.9:.45}"/><text x="${x(b*B)+6}" y="62" style="fill:#fff">block ${b}${el?" ✓":""}</text>`}
+const ls=Math.max(0,st-W);
+s+=`<rect x="${x(ls)}" y="34" width="${x(st+tile)-x(ls)}" height="46" fill="none" stroke="var(--amb)" stroke-width="3"/><text x="${x(ls)}" y="28" style="fill:var(--amb)">local window</text>`;
+s+=`<rect x="${x(st)}" y="86" width="${Math.max(3,x(tile)-10)}" height="14" fill="var(--red)"/><text x="${x(st)}" y="116">query tile ${st}–${st+tile-1}</text>`;
+if(cut>=0)s+=`<line x1="${x(cut+1)}" x2="${x(cut+1)}" y1="30" y2="84" stroke="var(--ind)" stroke-dasharray="4 3" stroke-width="2"/><text x="${x(cut+1)-4}" y="140" text-anchor="end" style="fill:var(--ind)">cutoff ${cut}</text>`;
+s+=`<rect x="${x(st+tile)}" y="40" width="${x(T)-x(st+tile)+0}" height="34" fill="var(--bg)" opacity=".7"/>`;
+$("#rsvg").innerHTML=s;
+const na=Math.min(6,64),nsel=Math.min(32,nb*na),cand=nsel*16,remote=Math.min(256,cand),loc=Math.min(st,W)+tile;
+const sink=4,summ=nb?64:0,sum=sink+remote+summ+loc||1;
+const seg=(n,c,l)=>n?`<span style="flex:${n};background:${c}">${l} ${n}</span>`:"";
+$("#rkeys").innerHTML=seg(sink,"var(--gry)","sink")+seg(remote,"var(--teal)","remote")+seg(summ,"var(--ind)","summary")+seg(loc,"var(--amb)","local");
+const gapLo=nb*B,gapHi=ls-1,gap=Math.max(0,gapHi-gapLo+1);
+$("#rtxt").innerHTML=`<table><tr><td>Eligible closed blocks</td><td><b>${nb}</b> (last token ≤ ${cut})</td></tr>
+<tr><td>Buckets scored</td><td>${nb} blocks × ${na} anchors = ${nb*na}</td></tr><tr><td>Buckets kept</td><td>${nsel}</td></tr>
+<tr><td>Candidate keys → after dedupe (≤)</td><td>${cand} → <b>${remote}</b></td></tr>
+<tr><td>Keys attended this tile</td><td><b>~${sum}</b> vs ${st+tile} for dense causal (${(100*sum/(st+tile)).toFixed(0)}%)</td></tr>
+<tr><td>Not yet visible gap</td><td>${gap>0?`<span class="bad">tokens ${gapLo}–${gapHi} (${gap})</span> are in an unclosed block and outside the window`:"none"}</td></tr></table>
+${nb==0?"<p class='mut'>No closed block is old enough, so this tile uses sinks and the local window only. That is the short-context fallback tested in Phase 2.</p>":""}`}
+qs.oninput=rsim;
+$("#tl").innerHTML=[512,1024,2048].map(n=>`<button data-n="${n}" class="${n==T?"on":""}">${n}</button>`).join(" ");
+$("#tl").onclick=e=>{const n=e.target.dataset.n;if(!n)return;T=+n;qs.value=Math.min(+qs.value,T-16);$("#tl").querySelectorAll("button").forEach(b=>b.classList.toggle("on",b.dataset.n==n));rsim()};rsim();
+
+const PH=[["Phase 1: reverse write index","Checks block layout, bucket capacity ≤16, block ownership of members, top-r assignment, two-stage retrieval, scalar vs batched retrieval parity, no duplicate keys, causal cutoff, summary mass. Gate: overflow rate &lt; 20%. Setup: 2×1024 tokens, 64 anchors."],
+["Phase 2: causal sparse attention","Output must match a slow per-tile manual-softmax oracle within 3e-5. Checks gradients for q, k, v and both index projections, short-context fallback, perturbing tokens ≥600 leaves outputs &lt;560 unchanged (1e-5), and a later key in the same tile cannot affect an earlier query."],
+["Phase 3: hybrid model","Smoke-tests a 4-layer model with R-LSA on: finite loss, finite gradients, index projections trained. Then builds the target 8-layer config, asserts 11,431,552 parameters, and writes <code>model_config.json</code>."],
+["Phase 4: training","Needs Phase 3. Runs the dense warm-up then R-LSA stage, logging router health, saves checkpoints and a test-set loss. Writes <code>last.pt</code>."],
+["Phase 5: ablation benchmark","Evaluates dense, swa, flat_lsa, rlsa, rlsa_no_summaries on identical windows with the same weights. Reports loss, perplexity, forward latency, tokens per second and peak VRAM. Explicitly not a PASS gate."],
+["Phase 6: profiling","Runs the R-LSA forward under torch.profiler. Labeled regions: index feature projection, reverse index build, batched retrieval, summary prefix and overlap, SDPA. Exports a table and Chrome trace."],
+["Utilities","<code>common.py</code> holds pass-file gating and device info. <code>check_checkpoint.py</code> strictly reloads a checkpoint and verifies the parameter count."]];
+$("#ph").innerHTML=PH.map(([t,d],i)=>`<details ${i==0?"open":""}><summary>${t}</summary><p>${d}</p></details>`).join("");
+</script></body></html>
