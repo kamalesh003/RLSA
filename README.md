@@ -63,9 +63,6 @@ Encoding test, cap 200,000 tokens -> data\test.bin
   wrote 200,000 tokens (0.38 MiB)
 DATA READY: C:\Users\Kamal\Downloads\reverse_lsa_complete_optimized\data
 
-C:\Users\Kamal\Downloads\reverse_lsa_complete_optimized>py -m phases.phase5_benchmark --device cuda --amp bf16 --split test --seq-len 1024 --batch-size 1 --eval-batches 8
-Phase 4 has not passed. Run: python -m phases.phase4
-
 C:\Users\Kamal\Downloads\reverse_lsa_complete_optimized>py -m phases.phase4_train --device cuda --amp bf16 --stage1-steps 200 --stage2-steps 200 --seq-len-stage1 512 --seq-len-stage2 1024 --batch-size 1 --grad-accum 2
 Device: cuda | model parameters: 11,431,552 | vocab: 8000
 Dataset tokens: train=5,000,000 val=200,000 test=200,000
