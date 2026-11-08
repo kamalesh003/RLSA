@@ -2,34 +2,67 @@
 
 ## What R-LSA is for
 
-R-LSA (Reverse Latent Sparse Attention) is a way to make the global attention layers of a long-context decoder-only model cheaper. Full attention costs O(T²) compute, and decoding has to read the whole KV cache for every new token. R-LSA lets each query look at only a small, content-selected subset of past tokens instead of all of them.
+R-LSA (Reverse Latent Sparse Attention) is a way to make the global attention layers of a long-context decoder-only model cheaper. Full attention costs O(T²) compute, and decoding has to read every cached key for each new token. R-LSA lets each query look at a small, content-selected subset of past tokens instead.
 
-In your code, a global layer's query sees four things:
+In your code, a global layer's query tile sees four things:
 
-1. **Sink tokens**, a few always-visible learned slots.
-2. **Local window**, the recent tokens (256 here).
-3. **Retrieved remote keys**, at most 256 old tokens chosen through the index.
-4. **Anchor summary tokens**, mass-weighted average K/V per anchor, which give a coarse view of everything not retrieved.
+1. **Sink tokens:** 4 learned, always-visible K/V slots per head.
+2. **Local window:** the previous 256 tokens plus the 16-token tile, with causal masking.
+3. **Retrieved remote keys:** at most 256 old tokens, chosen through the index.
+4. **Anchor summary tokens:** up to 64, each the mass-weighted average K/V of an anchor over all closed blocks. Keys already retrieved are subtracted, so nothing is counted twice.
 
-The "reverse" part is that the indexing work happens at write time. Each key is assigned to its top-r anchors within its block, and each bucket has a hard capacity. At read time a query only picks its top-a anchors and then the top-p buckets (a two-stage lookup) instead of scoring every key. So the per-query cost depends on the retrieval budget, not on context length.
+The "reverse" part is that the routing work happens at write time. Each key is assigned once to its top 2 anchors within its 256-token block, and each (block, anchor) bucket holds at most 16 keys. At read time a query tile picks its top 6 anchors, then the 32 best buckets across eligible blocks, then expands to member keys and dedupes. It never scores individual keys.
 
-In the hybrid model, most layers are cheap sliding-window attention with RoPE, and every 4th layer is a global NoPE layer that uses R-LSA for long-range retrieval.
+The attention step is capped at about 596 keys per tile regardless of context length. The read step scores centroids in every eligible block, and the index build touches every key, so total cost grows roughly linearly with T, not as T².
 
-## Where it can be used
+In the hybrid model, six of the eight layers are sliding-window attention with RoPE. Layers 4 and 8 are global NoPE layers that use R-LSA for long-range retrieval.
 
-- **Long-document and long-code LLMs:** books, legal and medical records, repository-level code, long chat histories.
-- **Long-context decoding with a KV cache:** decode is memory-bandwidth bound, so reading ~300 keys instead of 100K+ is where the biggest win would be.
-- **Agent and memory-style models:** retrieval over a long past inside the model rather than via an external RAG system.
-- **Other long sequences:** genomics, audio, logs, time series, and long-video tokens, where T is far beyond what dense attention handles comfortably.
-- **Memory-limited hardware:** laptops and edge devices, if you also compress or offload the KV cache.
+## Where it could be used
 
-It is not useful for short contexts. At 1K–4K tokens, a fused dense or flash attention kernel is hard to beat.
+These are design targets. This repo doesn't test any of them.
 
-## What your own results say
+- **Long-document and long-code models:** books, legal and medical records, repository-level code, long chat histories.
+- **Long-context decoding:** reading about 600 keys per step instead of the full cache is the biggest potential saving. The repo has no incremental decode path yet, and all K/V must still be stored, so the saving would be in reads, not memory.
+- **Memory-style and agent models:** retrieval over a long past inside the model, instead of an external RAG system.
+- **Other very long sequences:** genomics, audio, logs, time series, long-video tokens.
 
-- **Speed:** R-LSA is slower here (85 ms vs 35 ms dense at T=1024). That is expected, because the retrieval and indexing overhead only pays off once T is large enough that dense attention is clearly quadratic.
-- **Loss:** all five modes land at 6.689 ± 0.0003. That doesn't show R-LSA is lossless. At ppl ≈ 800 the model is barely past unigram-level, so the global layers aren't contributing long-range information yet, and the benchmark can't tell the modes apart.
-- **Router stats:** only about 24 remote keys are retrieved per query (out of a 256 budget), with 13% bucket overflow. The retrieval path is still lightly used.
+It isn't useful at short context. At 1K to 4K tokens, a fused dense or flash attention kernel is hard to beat.
+
+## What your own run shows
+
+**Speed (Phase 5, T=1024, forward only):**
+
+| Mode | Latency | vs dense |
+|---|---|---|
+| dense | 38.35 ms | 1.00× |
+| swa | 38.66 ms | 1.01× |
+| rlsa | 70.80 ms | 1.85× slower |
+| rlsa_no_summaries | 69.71 ms | 1.82× slower |
+| flat_lsa | 75.22 ms | 1.96× slower |
+
+At 1K there is nothing to save, because R-LSA attends to about as many keys as dense and adds indexing and retrieval work. Summaries cost only about 1 ms. Peak VRAM is identical across modes (0.136 GiB), so it says nothing about attention memory.
+
+**Quality:** all five modes land between 6.68883 and 6.68937 test loss (perplexity about 803.5), a spread of about 0.0005. That is noise. Even dense and sliding-window are identical, so the model isn't using anything beyond 256 tokens back yet.
+
+The model is barely trained. After 400 steps it sits at roughly word-frequency level. The stage 2 improvement (validation loss 6.86 to 6.54) can't be credited to R-LSA, because it had 200 more steps at a fresh learning rate.
+
+**Retrieval is barely used.** Only blocks that end at least 257 tokens behind the query are searchable, so at T=1024 only 31 of 64 tiles can retrieve anything. The logged mean remote keys per tile is 23.3, against a budget of 256.
+
+**Router health is still skewed.** The last stage 2 log shows:
+
+- **Overflow:** 22.0%, down from 45.5% at step 50.
+- **Write load per bucket:** 8.0 ± 10.1, with a max of 143.
+- **Anchor use:** the routing queries use 26 of 64 anchors, while the EMA statistics show 51 of 64 active. The write side is unbalanced even though capacity is double the writes per block.
+
+## Next steps
+
+1. Train much longer, until perplexity is well below 200.
+2. Add a dense-continuation control for stage 2.
+3. Benchmark at 2048 and 4096 to see where the latency curves cross.
+4. Add a synthetic recall test, with a fact planted 500 to 3,000 tokens back.
+5. Strengthen load balancing (`balance_step`) or raise `bucket_capacity`.
+6. Run `phase6_profile.py` to see where the extra 32 ms goes.
+
 
 **To Run:**
 
