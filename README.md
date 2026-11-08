@@ -1,4 +1,38 @@
 # RLSA
+
+## What R-LSA is for
+
+R-LSA (Reverse Latent Sparse Attention) is a way to make the global attention layers of a long-context decoder-only model cheaper. Full attention costs O(T²) compute, and decoding has to read the whole KV cache for every new token. R-LSA lets each query look at only a small, content-selected subset of past tokens instead of all of them.
+
+In your code, a global layer's query sees four things:
+
+1. **Sink tokens**, a few always-visible learned slots.
+2. **Local window**, the recent tokens (256 here).
+3. **Retrieved remote keys**, at most 256 old tokens chosen through the index.
+4. **Anchor summary tokens**, mass-weighted average K/V per anchor, which give a coarse view of everything not retrieved.
+
+The "reverse" part is that the indexing work happens at write time. Each key is assigned to its top-r anchors within its block, and each bucket has a hard capacity. At read time a query only picks its top-a anchors and then the top-p buckets (a two-stage lookup) instead of scoring every key. So the per-query cost depends on the retrieval budget, not on context length.
+
+In the hybrid model, most layers are cheap sliding-window attention with RoPE, and every 4th layer is a global NoPE layer that uses R-LSA for long-range retrieval.
+
+## Where it can be used
+
+- **Long-document and long-code LLMs:** books, legal and medical records, repository-level code, long chat histories.
+- **Long-context decoding with a KV cache:** decode is memory-bandwidth bound, so reading ~300 keys instead of 100K+ is where the biggest win would be.
+- **Agent and memory-style models:** retrieval over a long past inside the model rather than via an external RAG system.
+- **Other long sequences:** genomics, audio, logs, time series, and long-video tokens, where T is far beyond what dense attention handles comfortably.
+- **Memory-limited hardware:** laptops and edge devices, if you also compress or offload the KV cache.
+
+It is not useful for short contexts. At 1K–4K tokens, a fused dense or flash attention kernel is hard to beat.
+
+## What your own results say
+
+- **Speed:** R-LSA is slower here (85 ms vs 35 ms dense at T=1024). That is expected, because the retrieval and indexing overhead only pays off once T is large enough that dense attention is clearly quadratic.
+- **Loss:** all five modes land at 6.689 ± 0.0003. That doesn't show R-LSA is lossless. At ppl ≈ 800 the model is barely past unigram-level, so the global layers aren't contributing long-range information yet, and the benchmark can't tell the modes apart.
+- **Router stats:** only about 24 remote keys are retrieved per query (out of a 256 budget), with 13% bucket overflow. The retrieval path is still lightly used.
+
+**To Run:**
+
 C:\Users\Kamal\Downloads\reverse_lsa_complete_optimized>py -m phases.phase1 --device cuda
 PHASE 1 PASS: C:\Users\Kamal\Downloads\reverse_lsa_complete_optimized\artifacts\phase1_pass.json
 
